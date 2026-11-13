@@ -180,7 +180,7 @@ class Spec:
 
 # ----------------------------------------------------------------------------- RunPod
 class RunPod:
-    API = "https://rest.runpod.io/v1"
+    API = "https://api.runpod.io/v2"
     name = "runpod"
 
     def __init__(self, args):
@@ -221,38 +221,43 @@ class RunPod:
         return f"{self.gpu_ids(spec)[0]} ({self.cloud})"
 
     def create(self, spec, exclude):
+        # REST v2 accepts one GPU type per Pod. Keep the registry's first
+        # selected GPU and its existing secure/community placement order.
+        gpu_id = self.gpu_ids(spec)[0]
         body = {
-            "name": spec.name, "imageName": spec.image,
-            "dockerEntrypoint": [spec.entrypoint] if spec.entrypoint else [],
-            "dockerStartCmd": spec.arguments, "env": spec.env, "ports": [f"{spec.port}/http"],
-            "containerDiskInGb": spec.disk, "volumeInGb": 0, "gpuTypeIds": self.gpu_ids(spec),
-            "gpuTypePriority": "custom", "gpuCount": 1, "interruptible": False,
+            "name": spec.name, "image": spec.image,
+            "env": spec.env, "ports": [f"{spec.port}/http"],
+            "disk": spec.disk, "gpu": {"id": gpu_id, "count": 1},
         }
+        if spec.entrypoint:
+            body["entrypoint"] = [spec.entrypoint]
+        if spec.arguments:
+            body["cmd"] = spec.arguments
         for cloud in dict.fromkeys([self.cloud, "SECURE", "COMMUNITY"]):
-            body["cloudType"] = cloud
+            body["cloud"] = cloud
             try:
                 pod = self.call("POST", "/pods", body)
                 self.cloud = cloud
-                return {"id": pod["id"], "cost": pod.get("costPerHr"), "gpu": self.gpu_ids(spec)[0],
+                return {"id": pod["id"], "cost": pod.get("cost"), "gpu": gpu_id,
                         "endpoint": f"https://{pod['id']}-{spec.port}.proxy.runpod.net"}
             except SystemExit as error:
-                if "no instances currently available" not in str(error):
+                # Never retry ambiguous failures: a Pod may have been billed.
+                if "no instances currently available" not in str(error).lower():
                     raise
-                log(f"no {cloud} instances for {self.gpu_ids(spec)[0]} right now")
-        raise SystemExit(f"no RunPod instances available for {self.gpu_ids(spec)[0]}; try later or lower --disk")
+                log(f"no {cloud} instances for {gpu_id} right now")
+        raise SystemExit(f"no RunPod instances available for {gpu_id}; try later or lower --disk")
 
     def poll(self, handle):
         state = self.call("GET", f"/pods/{handle['id']}")
-        status = state.get("desiredStatus")
-        if status in ("EXITED", "TERMINATED"):
+        status = state.get("status")
+        if status in ("EXITED", "TERMINATED", "ERROR"):
             raise SystemExit(f"pod {status} before the server became healthy")
-        started = bool((state.get("runtime") or {}).get("uptimeInSeconds"))
-        handle["gpu"] = (state.get("machine") or {}).get("gpuTypeId") or handle["gpu"]
+        started = bool((state.get("runtime") or {}).get("uptime"))
+        handle["gpu"] = (state.get("gpu") or {}).get("id") or handle["gpu"]
         return started, f"pod {status}"
 
     def destroy(self, handle):
         self.call("DELETE", f"/pods/{handle['id']}")
-
 
 # ----------------------------------------------------------------------------- Vast.ai
 class Vast:
